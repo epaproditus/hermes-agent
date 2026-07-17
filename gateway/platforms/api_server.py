@@ -8,6 +8,7 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- GET  /v1/agent/config            — current Hermes agent configuration (provider, model, base_url, has_api_key)
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -1534,10 +1535,52 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         })
 
-    async def _handle_skills(self, request: "web.Request") -> "web.Response":
-        """GET /v1/skills — list installed skills visible to the API-server agent.
+    async def _handle_agent_config(self, request: "web.Request") -> "web.Response":
+        """GET /v1/agent/config - return the active Hermes agent configuration.
 
-        Read-only listing intended for external clients that need to know
+        External UIs (e.g. the BYO connector settings panel in the mobile app)
+        use this endpoint to discover what provider/model the Hermes agent is
+        currently configured with, so they can pre-populate pickers instead of
+        requiring the user to type provider and model names manually.
+
+        Returns:
+          provider     the active provider ID (e.g. "opencode-go", "openai")
+          model        the active model name (e.g. "deepseek-v4-flash")
+          base_url     optional base URL override (null if not set)
+          has_api_key  whether a provider API key is present (bool, not the key)
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from gateway.run import _resolve_runtime_agent_kwargs
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except Exception as exc:
+            logger.warning("Failed to resolve runtime agent config: %s", exc)
+            runtime_kwargs = {}
+
+        try:
+            from gateway.run import _load_gateway_config, _resolve_gateway_model
+            gw_config = _load_gateway_config()
+            model = _resolve_gateway_model(gw_config)
+        except Exception:
+            model = self._model_name or ""
+
+        provider = str(runtime_kwargs.get("provider") or "")
+        base_url = runtime_kwargs.get("base_url") or None
+        has_api_key = bool(runtime_kwargs.get("api_key"))
+
+        return web.json_response({
+            "provider": provider,
+            "model": model,
+            "base_url": base_url,
+            "has_api_key": has_api_key,
+        })
+
+    async def _handle_skills(self, request: "web.Request") -> "web.Response":
+        """GET /v1/skills - list installed skills visible to the API-server agent.
+
         which skills are available without sending a chat message and asking
         the model. Mirrors what the gateway/CLI surfaces through
         ``/skills list``, but as a deterministic JSON payload.
@@ -4771,6 +4814,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/agent/config", self._handle_agent_config)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
