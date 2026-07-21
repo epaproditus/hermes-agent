@@ -13,11 +13,12 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 # ---------------------------------------------------------------------------
 # Ensure Hermes core is importable when loaded as a bundled plugin
@@ -288,35 +289,500 @@ class FluxerRESTClient:
             self._client = None
 
 
-# ---- Fluxer Gateway Client (stub) -----------------------------------------
+# ---- Gateway opcodes & close codes ----------------------------------------
+
+
+class GatewayOp:
+    """Fluxer-compatible Discord gateway opcodes."""
+    DISPATCH = 0
+    HEARTBEAT = 1
+    IDENTIFY = 2
+    PRESENCE_UPDATE = 3
+    VOICE_STATE_UPDATE = 4
+    RESUME = 6
+    RECONNECT = 7
+    REQUEST_GUILD_MEMBERS = 8
+    INVALID_SESSION = 9
+    HELLO = 10
+    HEARTBEAT_ACK = 11
+
+
+# ---- Fluxer Gateway Client -------------------------------------------------
 
 
 class FluxerGatewayClient:
     """Manages a WebSocket connection to the Fluxer gateway.
 
-    Responsible for:
-    - Establishing and maintaining the WebSocket connection
-    - Receiving real-time events (messages, presence, etc.)
-    - Heartbeat / keep-alive handling
-    - Reconnection with exponential backoff
+    Implements the Discord-compatible gateway protocol with opcodes
+    0-16, handling the full HELLO/IDENTIFY/READY lifecycle, periodic
+    heartbeat, session resume, and dispatch routing.
+
+    Usage::
+
+        client = FluxerGatewayClient(token, gateway_url)
+        client.on_dispatch = my_async_handler
+        if await client.connect():
+            # connected — events flow to on_dispatch
+            ...
+        await client.disconnect()
     """
 
-    def __init__(self, token: str, api_url: str) -> None:
+    # Default heartbeat interval (ms) — used before HELLO arrives.
+    _DEFAULT_HEARTBEAT_INTERVAL: int = 41250
+    # Timeout for waiting on a HEARTBEAT_ACK after sending a heartbeat (ms).
+    _HEARTBEAT_TIMEOUT: float = 45.0  # seconds
+    # Close codes that are fatal (no reconnect possible).
+    _FATAL_CLOSE_CODES: set[int] = {4004, 4010, 4012}
+    # Close codes that signal a rate-limit backoff.
+    _RATE_LIMIT_CLOSE_CODES: set[int] = {4008}
+    # Normal disconnect code sent by the client.
+    _CLOSE_CODE_NORMAL: int = 1000
+    # Maximum allowed payload size for gateway messages.
+    _MAX_PAYLOAD_SIZE: int = 4096
+
+    def __init__(self, token: str, gateway_url: str) -> None:
         self.token = token
-        self.api_url = api_url.rstrip("/")
+        self.gateway_url = gateway_url
+
+        # WebSocket state
+        self._ws: Any = None  # WebSocketClientProtocol
         self._connected = False
+        self._close_code: Optional[int] = None
 
-    async def connect(self) -> bool:
-        """Open the WebSocket connection and authenticate."""
-        raise NotImplementedError  # pragma: no cover
+        # Session tracking
+        self._session_id: Optional[str] = None
+        self._last_seq: Optional[int] = None
 
-    async def disconnect(self) -> None:
-        """Close the WebSocket connection gracefully."""
-        raise NotImplementedError  # pragma: no cover
+        # Heartbeat state (wall-clock seconds)
+        self._heartbeat_interval: Optional[float] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._heartbeat_ack_received: bool = False
+
+        # Dispatch loop task (runs independently after handshake)
+        self._dispatch_task: Optional[asyncio.Task] = None
+
+        # Dispatch callback — set by the consumer (e.g. FluxerAdapter)
+        self.on_dispatch: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None
+
+        # Reconnect hook — set during close-code handling
+        self._on_reconnect_requested: Optional[Callable[[], Awaitable[None]]] = None
+
+        # Internal control
+        self._disconnect_requested = False
+
+    # ---- Public properties -------------------------------------------------
 
     @property
     def is_connected(self) -> bool:
+        """Return whether the WebSocket is currently connected."""
         return self._connected
+
+    @property
+    def session_id(self) -> Optional[str]:
+        """Return the session identifier for RESUME recovery."""
+        return self._session_id
+
+    @property
+    def last_seq(self) -> Optional[int]:
+        """Return the last sequence number for RESUME recovery."""
+        return self._last_seq
+
+    # ---- Connection lifecycle ----------------------------------------------
+
+    async def connect(self) -> bool:
+        """Open the WebSocket connection and authenticate.
+
+        Steps:
+        1. Connect to ``self.gateway_url``
+        2. Wait for HELLO (op 10) → extract heartbeat interval
+        3. Send IDENTIFY (op 2) with bot token
+        4. Wait for READY (op 0) → extract session_id
+        5. Start heartbeat loop
+        6. Begin dispatch loop
+
+        Returns ``True`` if the full handshake completed, ``False``
+        otherwise.  Raises ``AuthenticationError`` on close code 4004.
+        """
+        try:
+            async with websockets.connect(self.gateway_url) as ws:
+                self._ws = ws
+                self._connected = True
+                self._disconnect_requested = False
+
+                # 1. Wait for HELLO (op 10)
+                hello_raw = await ws.recv()
+                hello = json.loads(hello_raw)
+                if hello.get("op") != GatewayOp.HELLO:
+                    logger.warning(
+                        "Expected HELLO (op 10), got op %s", hello.get("op")
+                    )
+                    await self._teardown()
+                    return False
+
+                interval_ms = hello["d"].get("heartbeat_interval", self._DEFAULT_HEARTBEAT_INTERVAL)
+                self._heartbeat_interval = interval_ms / 1000.0
+
+                # 2. Send IDENTIFY (op 2)
+                identify = {
+                    "op": GatewayOp.IDENTIFY,
+                    "d": {
+                        "token": self.token,
+                        "properties": {
+                            "os": "linux",
+                            "browser": "hermes-agent",
+                            "device": "hermes-agent",
+                        },
+                    },
+                }
+                await ws.send(json.dumps(identify))
+
+                # 3. Wait for READY (op 0, event READY) or INVALID_SESSION
+                while True:
+                    ready_raw = await ws.recv()
+                    ready = json.loads(ready_raw)
+
+                    op = ready.get("op")
+
+                    # INVALID_SESSION (op 9) → authentication failure
+                    if op == GatewayOp.INVALID_SESSION:
+                        logger.warning("Gateway returned INVALID_SESSION during connect")
+                        await self._teardown()
+                        return False
+
+                    # DISPATCH with READY event
+                    if op == GatewayOp.DISPATCH and ready.get("t") == "READY":
+                        d = ready["d"]
+                        self._session_id = d.get("session_id")
+                        seq = ready.get("s")
+                        if seq is not None:
+                            self._last_seq = seq
+                        logger.info(
+                            "Gateway ready — session_id=%s, last_seq=%s",
+                            self._session_id, self._last_seq,
+                        )
+
+                        # Fire on_dispatch for READY
+                        if self.on_dispatch is not None:
+                            await self.on_dispatch("READY", d)
+
+                        break
+
+                    # Unexpected close during handshake
+                    if not ws.open:
+                        await self._teardown()
+                        return False
+
+                # 4. Start heartbeat loop
+                self._heartbeat_task = asyncio.create_task(
+                    self._heartbeat_loop()
+                )
+
+                # 5. Start dispatch reading loop in background
+                self._dispatch_task = asyncio.create_task(
+                    self._dispatch_loop()
+                )
+
+                return True
+
+        except AuthenticationError:
+            # Re-raise so the caller knows it's fatal
+            await self._teardown()
+            raise
+        except Exception as exc:
+            logger.error("WebSocket connection failed: %s", exc)
+            await self._teardown()
+
+        return self._connected
+
+    async def disconnect(self) -> None:
+        """Close the WebSocket connection gracefully.
+
+        Sends a close frame with code 1000, stops the heartbeat loop,
+        and resets connection state.  Safe to call when already
+        disconnected.
+        """
+        if self._ws is not None:
+            self._disconnect_requested = True
+            try:
+                await self._ws.close(code=self._CLOSE_CODE_NORMAL)
+            except Exception:
+                pass
+        await self._teardown()
+
+    async def resume(self) -> bool:
+        """Reconnect and send RESUME (op 6) to restore the session.
+
+        Requires a prior successful ``connect()`` that produced a
+        ``session_id`` and ``last_seq``.  Returns ``True`` if the
+        session was restored successfully.
+
+        On INVALID_SESSION (op 9), returns ``False`` — the caller
+        should fall back to a fresh ``connect()``.
+        """
+        if self._session_id is None or self._last_seq is None:
+            return False
+
+        try:
+            async with websockets.connect(self.gateway_url) as ws:
+                self._ws = ws
+                self._connected = True
+                self._disconnect_requested = False
+
+                # Wait for HELLO
+                hello_raw = await ws.recv()
+                hello = json.loads(hello_raw)
+                if hello.get("op") != GatewayOp.HELLO:
+                    await self._teardown()
+                    return False
+
+                interval_ms = hello["d"].get("heartbeat_interval", self._DEFAULT_HEARTBEAT_INTERVAL)
+                self._heartbeat_interval = interval_ms / 1000.0
+
+                # Send RESUME (op 6)
+                resume_payload = {
+                    "op": GatewayOp.RESUME,
+                    "d": {
+                        "token": self.token,
+                        "session_id": self._session_id,
+                        "seq": self._last_seq,
+                    },
+                }
+                await ws.send(json.dumps(resume_payload))
+
+                # Wait for READY or INVALID_SESSION
+                while True:
+                    raw = await ws.recv()
+                    data = json.loads(raw)
+
+                    op = data.get("op")
+                    if op == GatewayOp.INVALID_SESSION:
+                        logger.warning("RESUME rejected — session invalid")
+                        await self._teardown()
+                        return False
+
+                    if op == GatewayOp.DISPATCH and data.get("t") == "READY":
+                        d = data["d"]
+                        self._session_id = d.get("session_id", self._session_id)
+                        seq = data.get("s")
+                        if seq is not None:
+                            self._last_seq = seq
+                        break
+
+                # Start heartbeat and dispatch loops
+                self._heartbeat_task = asyncio.create_task(
+                    self._heartbeat_loop()
+                )
+                self._dispatch_task = asyncio.create_task(
+                    self._dispatch_loop()
+                )
+                return True
+
+        except AuthenticationError:
+            await self._teardown()
+            raise
+        except Exception:
+            logger.exception("Error during resume")
+            await self._teardown()
+            return False
+
+        return True
+
+    def can_resume(self) -> bool:
+        """Return whether a RESUME is possible (session data exists)."""
+        return self._session_id is not None and self._last_seq is not None
+
+    # ---- Internal: heartbeat -----------------------------------------------
+
+    async def _heartbeat_loop(self) -> None:
+        """Send HEARTBEAT (op 1) at the interval from HELLO.
+
+        The interval is taken from ``self._heartbeat_interval``
+        (seconds).  After each heartbeat the loop waits for up to
+        ``_HEARTBEAT_TIMEOUT`` seconds for a HEARTBEAT_ACK (op 11),
+        which is tracked by the dispatch loop.  If the ACK does not
+        arrive in time the connection is considered dead.
+        """
+        interval = self._heartbeat_interval or (self._DEFAULT_HEARTBEAT_INTERVAL / 1000.0)
+
+        while self._connected and not self._disconnect_requested:
+            await asyncio.sleep(interval)
+
+            if not self._connected or self._disconnect_requested:
+                break
+
+            # Send heartbeat with the last sequence number
+            seq = self._last_seq if self._last_seq is not None else None
+            heartbeat = {"op": GatewayOp.HEARTBEAT, "d": seq}
+
+            self._heartbeat_ack_received = False
+            try:
+                await self._ws.send(json.dumps(heartbeat))
+            except Exception:
+                logger.warning("Failed to send heartbeat")
+                break
+
+            # Wait for ACK (set by _dispatch_loop when it sees op 11)
+            try:
+                await asyncio.wait_for(
+                    self._wait_for_ack(), timeout=self._HEARTBEAT_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Heartbeat ACK timeout — no response in %ss",
+                    self._HEARTBEAT_TIMEOUT,
+                )
+                await self._ws.close(code=1000)
+                break
+
+    async def _wait_for_ack(self) -> None:
+        """Wait until ``_heartbeat_ack_received`` is set by the dispatch loop."""
+        while not self._heartbeat_ack_received and not self._disconnect_requested:
+            await asyncio.sleep(0.05)
+
+    # ---- Internal: dispatch loop -------------------------------------------
+
+    async def _dispatch_loop(self) -> None:
+        """Read messages from the WebSocket and route them to dispatch handling.
+
+        Runs as a background reader: each received message that is a
+        DISPATCH (op 0) is routed to ``_handle_raw_dispatch``, which
+        fires ``on_dispatch``.  Other opcodes (RECONNECT op 7,
+        INVALID_SESSION op 9) are handled inline.  The loop exits on
+        connection close or disconnect request.
+        """
+        try:
+            async for raw in self._ws:
+                if self._disconnect_requested:
+                    break
+
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("Received non-JSON message from gateway")
+                    continue
+
+                op = data.get("op")
+
+                if op == GatewayOp.DISPATCH:
+                    await self._handle_raw_dispatch(data)
+                elif op == GatewayOp.HEARTBEAT_ACK:
+                    self._heartbeat_ack_received = True
+                elif op == GatewayOp.RECONNECT:
+                    logger.info("Gateway requested reconnect (op 7)")
+                    if self._on_reconnect_requested is not None:
+                        await self._on_reconnect_requested()
+                    break
+                elif op == GatewayOp.INVALID_SESSION:
+                    logger.info("Gateway invalidated session (op 9)")
+                    break
+                # Ignore other opcodes silently
+        except Exception as exc:
+            # Normal on disconnect (connection dropped)
+            pass
+
+        # If the loop exits (connection dropped), clean up
+        if self._connected and not self._disconnect_requested:
+            # Connection dropped unexpectedly
+            if self._close_code in self._RATE_LIMIT_CLOSE_CODES:
+                if self._on_reconnect_requested is not None:
+                    await self._on_reconnect_requested()
+            elif self._close_code in self._FATAL_CLOSE_CODES:
+                pass  # Caller handles fatal codes
+            await self._teardown()
+
+    async def _handle_raw_dispatch(self, data: Dict[str, Any]) -> None:
+        """Process a single DISPATCH (op 0) frame.
+
+        Updates ``_last_seq`` and calls ``on_dispatch`` if set.
+        The callback receives the event type string and the event data
+        dictionary.
+        """
+        event_type = data.get("t")
+        event_data = data.get("d", {})
+        seq = data.get("s")
+        if seq is not None:
+            self._last_seq = seq
+
+        if event_type and self.on_dispatch is not None:
+            try:
+                await self.on_dispatch(event_type, event_data)
+            except Exception:
+                logger.exception(
+                    "on_dispatch handler failed for event %s", event_type
+                )
+
+    # ---- Internal: close code handling -------------------------------------
+
+    async def _handle_close(
+        self, code: int, reason: str = ""
+    ) -> None:
+        """Handle a gateway close code.
+
+        Determines whether the close code is fatal (raises
+        ``AuthenticationError`` for 4004/4010/4012), rate-limit
+        related (4008 — schedules a reconnect), or recoverable
+        (other codes — clean teardown).
+        """
+        self._close_code = code
+        logger.info("Gateway closed — code=%d, reason=%s", code, reason or "none")
+
+        if code == 4004:
+            raise AuthenticationError(
+                f"Authentication failed (code {code}): {reason}"
+            )
+
+        if code in self._FATAL_CLOSE_CODES:
+            logger.error(
+                "Fatal gateway close code %d (%s) — reconnecting is not possible",
+                code, reason,
+            )
+            return
+
+        if code in self._RATE_LIMIT_CLOSE_CODES:
+            logger.warning("Rate-limited by gateway (code %d) — will reconnect", code)
+            if self._on_reconnect_requested is not None:
+                await self._on_reconnect_requested()
+            return
+
+        # Other codes (4001, 4002, 4003, 4007, 4009, etc.) — recoverable
+        logger.info("Gateway close code %d — recoverable", code)
+
+    # ---- Internal: teardown ------------------------------------------------
+
+    async def _teardown(self) -> None:
+        """Reset all internal state after a disconnect.
+
+        Stops the heartbeat task, closes the WebSocket if still open,
+        and resets the connection flag.  Does NOT clear session_id or
+        last_seq (they are needed for RESUME).
+        """
+        self._connected = False
+
+        # Stop heartbeat
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+
+        # Stop dispatch loop
+        if self._dispatch_task is not None:
+            self._dispatch_task.cancel()
+            try:
+                await self._dispatch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._dispatch_task = None
+
+        # Close WebSocket
+        if self._ws is not None:
+            try:
+                await self._ws.close(code=self._CLOSE_CODE_NORMAL)
+            except Exception:
+                pass
+            self._ws = None
 
 
 # ---- Fluxer Platform Adapter ----------------------------------------------
@@ -342,21 +808,47 @@ class FluxerAdapter(BasePlatformAdapter):
         )
         self._gateway: Optional[FluxerGatewayClient] = None
         self._rest: Optional[FluxerRESTClient] = None
+        self._bot_user: Optional[Dict[str, Any]] = None
 
     # ---- BasePlatformAdapter abstract methods -----------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the Fluxer instance.
 
-        Initialises the gateway client and opens the WebSocket connection.
-        On reconnect (is_reconnect=True), applies backoff / state recovery.
+        Creates the REST client first to resolve the gateway WebSocket
+        URL from ``GET /gateway/bot``, then opens the WebSocket
+        connection and wires ``_handle_event`` as the dispatch
+        callback.
+
+        On reconnect (is_reconnect=True), the gateway client's
+        ``resume()`` method is attempted first, falling back to
+        a fresh ``connect()`` if the session is invalid.
         """
-        self._gateway = FluxerGatewayClient(self._token, self._api_url)
         self._rest = FluxerRESTClient(
             base_url=self._api_url,
             bot_token=self._token,
         )
-        connected = await self._gateway.connect()
+
+        # Resolve gateway URL from the REST API
+        try:
+            gateway_info = await self._rest.get_gateway_bot()
+            gateway_url = gateway_info.get(
+                "url",
+                self._api_url.replace("http://", "ws://").replace("https://", "wss://")
+                + "/gateway",
+            )
+        except Exception:
+            logger.warning("Failed to resolve gateway URL, using default")
+            gateway_url = self._api_url.replace("http://", "ws://").replace("https://", "wss://")
+
+        self._gateway = FluxerGatewayClient(self._token, gateway_url)
+        self._gateway.on_dispatch = self._handle_event
+
+        if is_reconnect and self._gateway.can_resume():
+            connected = await self._gateway.resume()
+        else:
+            connected = await self._gateway.connect()
+
         if connected:
             logger.info(
                 "Fluxer adapter %s to %s",
@@ -364,6 +856,25 @@ class FluxerAdapter(BasePlatformAdapter):
                 self._api_url,
             )
         return connected
+
+    async def _handle_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """Receive and route gateway dispatch events.
+
+        Called by ``FluxerGatewayClient.on_dispatch`` for every
+        DISPATCH (op 0) event received from the gateway.
+
+        This is a basic router that will be extended by PLY-327
+        (event normalization and dispatch routing).
+        """
+        logger.debug("Fluxer gateway event: %s", event_type)
+
+        if event_type == "READY":
+            self._bot_user = data.get("user")
+        elif event_type == "MESSAGE_CREATE":
+            # Basic message handling — extended by PLY-327
+            pass
+        elif event_type == "TYPING_START":
+            pass
 
     async def disconnect(self) -> None:
         """Disconnect from the Fluxer instance."""
@@ -405,7 +916,7 @@ class FluxerAdapter(BasePlatformAdapter):
 
     def get_me(self) -> Optional[Dict[str, Any]]:
         """Return the bot user's identity metadata, or None if unknown."""
-        return None  # pragma: no cover
+        return self._bot_user
 
 
 # ---- Requirements check ---------------------------------------------------
