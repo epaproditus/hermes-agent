@@ -65,10 +65,13 @@ from gateway.platforms.base import (
     BasePlatformAdapter, CachedMedia, SendResult, cache_media_bytes_async,
 )
 from gateway.platforms.helpers import cancel_task
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.config import Platform
 
 
+_PRESENCE_KIND = 20001
+_TYPING_KIND = 20002
+_PRESENCE_HEARTBEAT_SECS = 60.0  # relay expires a presence entry after ~180s
 _CHAT_KIND = 9  # ``messages get`` also returns housekeeping kinds, never dispatched
 # Chat + forum post/comment; stream kinds wait for confirmed semantics. ``_is_direct_message_event``
 # stays kind-9-only so a p-tagged forum post can't be reclassified as a DM and bypass mention gating.
@@ -506,6 +509,9 @@ _ATTACHMENT_KIND_TYPES = {"image": MessageType.PHOTO, "video": MessageType.VIDEO
 class BuzzAdapter(BasePlatformAdapter):
     """Buzz adapter (WebSocket push with poll fallback) for the BasePlatformAdapter interface."""
 
+    _OK_EMOJI = "✅"
+    _FAIL_EMOJI = "❌"
+
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("buzz"))
         extra = getattr(config, "extra", {}) or {}
@@ -545,6 +551,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # Identity — filled in by connect() from ``buzz users get``
         self._self_pubkey = self._self_npub = self._display_name = ""
         self._poll_task: Optional[asyncio.Task] = None
+        self._presence_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._membership_since = self._poll_count = 0
@@ -684,6 +691,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 return False
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
+        # Presence: announce online and keep the relay's ~180s TTL alive with a 60s heartbeat.
+        await self._publish_presence("online")
+        self._presence_task = asyncio.create_task(self._presence_loop())
         self._mark_connected()
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
@@ -702,6 +712,11 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task = None
         await cancel_task(self._poll_task)
         self._poll_task = None
+        await cancel_task(self._presence_task)
+        self._presence_task = None
+        # Best-effort "offline" so the relay clears our presence entry immediately
+        # instead of waiting out the ~180s TTL.
+        await self._publish_presence("offline")
         self._channel_state = {}
         self._poll_count = 0
 
@@ -845,7 +860,14 @@ class BuzzAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=event_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Buzz has no typing indicator API — no-op."""
+        """Publish a kind:20002 typing event. Best-effort — never raises; the turn
+        machinery already calls this repeatedly during a turn, so no keepalive loop needed here."""
+        if not self._private_key:
+            return
+        try:
+            await self._send_ephemeral(self._build_ephemeral_event(_TYPING_KIND, "", [["h", str(chat_id)]]))
+        except Exception:
+            logger.debug("Buzz: typing publish failed", exc_info=True)
 
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Best-effort reaction via buzz-cli; failures are logged, never raised."""
@@ -856,6 +878,85 @@ class BuzzAdapter(BasePlatformAdapter):
         if code != 0:
             logger.debug("Buzz: reaction add failed for message %s in %s — %s", message_id[:12], chat_id, _cli_error_message(err, code))
         return code == 0
+
+    async def _remove_reaction(self, chat_id: str, message_id: str) -> bool:
+        """Remove our own 👀 ack via buzz-cli; failures are logged, never raised."""
+        if not self.cli_path or not message_id:
+            return False
+        code, _out, err = await self._run_cli(["reactions", "remove", "--event", str(message_id), "--emoji", "👀"])
+        if code != 0:
+            logger.debug("Buzz: reaction remove failed for message %s in %s — %s", message_id[:12], chat_id, _cli_error_message(err, code))
+        return code == 0
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """👀 seen ack while a turn is in flight — visibility into whether the agent is doing anything."""
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if chat_id and message_id:
+            await self.send_reaction(chat_id, message_id, "👀")
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Swap 👀 for ✅/❌. CANCELLED leaves it unreacted."""
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not chat_id or not message_id:
+            return
+        await self._remove_reaction(chat_id, message_id)
+        emoji = {ProcessingOutcome.SUCCESS: self._OK_EMOJI, ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
+        if emoji:
+            await self.send_reaction(chat_id, message_id, emoji)
+
+    def _build_ephemeral_event(self, kind: int, content: str, tags: List[List[str]]) -> dict:
+        """Sign a kind:2000x ephemeral event with the identity key."""
+        pubkey = _nostr_auth.public_key_hex(self._private_key)
+        timestamp = int(time.time())
+        serialized = json.dumps(
+            [0, pubkey, timestamp, kind, tags, content], separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        event_id = hashlib.sha256(serialized).digest()
+        return {
+            "id": event_id.hex(), "pubkey": pubkey, "created_at": timestamp, "kind": kind,
+            "tags": tags, "content": content, "sig": _nostr_auth.schnorr_sign(event_id, self._private_key).hex(),
+        }
+
+    async def _send_ephemeral(self, event: dict) -> None:
+        """Publish an ephemeral event over a short-lived authenticated WebSocket.
+
+        Ephemeral kinds are only accepted over an authenticated connection, so this
+        reuses ``_authenticate_websocket`` (same NIP-42 handshake as the inbound transport)
+        on a dedicated connection rather than the shared inbound socket.
+        """
+        import websockets
+        url = self._websocket_url()
+        async with websockets.connect(url, open_timeout=_WS_AUTH_TIMEOUT, close_timeout=5) as ws:
+            await self._authenticate_websocket(ws)
+            await ws.send(json.dumps(["EVENT", event], separators=(",", ":")))
+            while True:
+                response = json.loads(await asyncio.wait_for(ws.recv(), timeout=_WS_AUTH_TIMEOUT))
+                if isinstance(response, list) and len(response) >= 3 and response[0] == "OK" and response[1] == event["id"]:
+                    if response[2] is not True:
+                        raise ConnectionError(f"ephemeral publish rejected: {response[3] if len(response) > 3 else '?'}")
+                    return
+
+    async def _publish_presence(self, status: str) -> None:
+        """Publish a kind:20001 presence event ("online"/"offline"). Never raises."""
+        if not self._private_key:
+            return
+        try:
+            await self._send_ephemeral(self._build_ephemeral_event(_PRESENCE_KIND, status, []))
+        except Exception:
+            logger.debug("Buzz: presence publish (%s) failed", status, exc_info=True)
+
+    async def _presence_loop(self) -> None:
+        """60s presence heartbeat; relay expires the entry after ~180s."""
+        try:
+            while True:
+                await asyncio.sleep(_PRESENCE_HEARTBEAT_SECS)
+                await self._publish_presence("online")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Buzz: presence heartbeat loop crashed", exc_info=True)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         """Edit a sent message (streamed replies). The CLI reports a NEW event id but the stream consumer
